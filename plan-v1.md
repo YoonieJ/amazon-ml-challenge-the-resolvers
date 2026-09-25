@@ -14,13 +14,15 @@ We checked this directly against the files in `dataset/`, not just the problem s
 - Test: 1,732,544 Source 1 rows, 4,887,273 Source 2 rows, 5,082,316 Source 3 rows. A naive cross join is on the order of 10^13 pairs, so blocking is not optional for us, it is the whole ballgame.
 - Ground truth match-count distribution per Source 1 entity: 123,247 singletons (5.6%), the rest mostly 2-5 matches (peak at 3), tapering to a handful with up to 11 matches. So most entities do have matches, but a meaningful chunk have none, and we need to get both right.
 - Country in train is only `US` and `India`. Test adds `France` (259,452 of 1,732,544 Source 1 rows, about 15%) with zero training examples. We must not special-case country values anywhere in the pipeline.
-- Addresses are frequently incomplete or blank (we found an India record with an empty `business_address` field entirely).
+- `entity_id` is unique within every file, and `business_name` and `country` are never blank anywhere, train or test. Source 1's `business_address` is never blank either. Blank addresses only happen on the candidate side: about 3% of rows in both Source 2 and Source 3, train and test alike (168,967 of 5,034,616 train Source 2 rows, 175,916 of 5,285,603 train Source 3 rows, and a comparable rate in test). So "address missing" is a candidate-side feature concern, not something we need to worry about for Source 1 itself.
 - Names are not consistently Latin script. We found an India Source 2 record with the business name written entirely in Devanagari (`राम मार्केटिंग प्राइवेट लिमिटेड`) while other India records use Latin-script English. French test names/addresses will add a second non-English language, though still Latin script with accents.
 - We checked the ground truth for a one-to-one constraint: across all 7,638,365 matched (S2/S3) id occurrences in `train_ground_truth.tsv`, every single one belongs to exactly one Source 1 entity, zero exceptions. So a given S2/S3 record legitimately matches at most one Source 1 business, always. This is a real constraint we can enforce, not an assumption.
 
 Implication: our normalization has to be script-aware and can't assume English tokens. Cross-script name matches (same business, one record in Devanagari, one transliterated to Latin) are a real but probably rare case, we'll handle it by falling back to address/country signal rather than solving it outright.
 
 ## 3. Architecture
+
+Every file here is 100MB-500MB, and pairwise feature extraction over even a capped candidate set is tens of millions of rows. We're keeping this on vectorized pandas/numpy operations end to end (no per-row Python loops), and we'll reach for polars or chunked processing only if a specific step actually turns out to be a bottleneck, not preemptively.
 
 We're building four stages, in order:
 
@@ -31,7 +33,7 @@ We're building four stages, in order:
    - Address token overlap, especially any digit sequences (street numbers, PIN/ZIP codes), which are high-precision blocking signals when present.
    - Character n-gram (e.g. trigram) MinHash/LSH as a fallback pass for near-duplicates that share no exact tokens (typos, transliteration).
    We cap candidates per Source 1 entity (e.g. top-K by cheap token-overlap or TF-IDF cosine score) so our pairwise feature stage stays tractable. This capped, final list is exactly `candidate_pairs.tsv`.
-3. **Pairwise matching model**: a gradient-boosted tree classifier (LightGBM or XGBoost, both MIT/BSD licensed and nowhere near 8B parameters) trained on labeled pairs from our blocking candidates: positives from ground truth, negatives sampled from candidates that aren't true matches. Features we compute per (S1, candidate) pair:
+3. **Pairwise matching model**: a gradient-boosted tree classifier (LightGBM or XGBoost, both MIT/BSD licensed and nowhere near 8B parameters) trained on labeled pairs from our blocking candidates: positives from ground truth, negatives are every other candidate in that S1's blocked set (true matches are typically 1 of 5-20 candidates once blocking is capped, so we lean on LightGBM's native class-imbalance handling, e.g. `scale_pos_weight` or `is_unbalance`, rather than discarding negatives and losing the hard-negative signal that's actually useful for precision). Features we compute per (S1, candidate) pair:
    - Name: token Jaccard, character n-gram Jaccard/cosine, Levenshtein ratio, Jaro-Winkler, length difference, common-prefix length.
    - Address: token overlap, digit/number-sequence overlap, Levenshtein ratio on normalized address, an explicit "address missing" flag rather than letting a blank string silently score as zero-similarity.
    - Country exact-match flag (used as a feature, not a filter, so France just becomes an unseen category the tree splits on naturally).
@@ -80,7 +82,10 @@ We're deliberately skipping deep learning or embedding/transformer models for th
 
 We're putting pipeline code under `student_resource/code/business_entity_resolution/src/` to match the required submission structure directly, rather than building it somewhere else and moving it later. Our `requirements.txt` pins pandas, numpy, and whichever of lightgbm/xgboost we settle on, kept as small as the task allows.
 
+We're fixing a random seed everywhere we split, sample, or train (validation split, negative sampling if we end up doing any, LightGBM itself), since the submission has to be reproducible end to end from `code/business_entity_resolution/` by someone who isn't us.
+
 ## 8. Open questions we need to confirm before going further
 
 - Whether a local transliteration library (`unidecode` or similar) counts as acceptable normalization or crosses into the kind of tooling the rules mean to exclude. We're treating it as excluded by default unless confirmed, and relying on address/country signal for cross-script matches instead.
 - Our target candidate cap per Source 1 entity (affects both recall ceiling and compute time for feature extraction across ~1.7M-2.2M Source 1 entities). We'll decide this empirically from the recall-ceiling-vs-candidate-set-size curve on train, not up front.
+- What hardware we're actually running this on (RAM in particular). This decides whether plain pandas is fine end to end or whether we need to chunk the largest joins, and it's not something we can determine from the repo.
