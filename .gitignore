@@ -1,0 +1,42 @@
+# project-specific
+dataset/
+*.pdf
+.serena/
+output/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# editors / IDEs
+.vscode/
+.idea/
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ML artifacts
+*.pkl
+*.joblib
+*.pt
+*.pth
+*.ckpt
+*.h5
+models/
+
+# logs
+*.log
