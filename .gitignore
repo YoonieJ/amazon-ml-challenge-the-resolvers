@@ -1,5 +1,7 @@
 # project-specific
 dataset/
+*.tsv
+*.parquet
 *.pdf
 .serena/
 output/

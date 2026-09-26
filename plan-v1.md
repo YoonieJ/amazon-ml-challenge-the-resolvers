@@ -89,3 +89,28 @@ We're fixing a random seed everywhere we split, sample, or train (validation spl
 - Whether a local transliteration library (`unidecode` or similar) counts as acceptable normalization or crosses into the kind of tooling the rules mean to exclude. We're treating it as excluded by default unless confirmed, and relying on address/country signal for cross-script matches instead.
 - Our target candidate cap per Source 1 entity (affects both recall ceiling and compute time for feature extraction across ~1.7M-2.2M Source 1 entities). We'll decide this empirically from the recall-ceiling-vs-candidate-set-size curve on train, not up front.
 - What hardware we're actually running this on (RAM in particular). This decides whether plain pandas is fine end to end or whether we need to chunk the largest joins, and it's not something we can determine from the repo.
+
+## 9. Backup: running on AWS if local compute isn't enough
+
+We hit this for real, not hypothetically: blocking a 50k-row slice of Source 1 against the full train Source 2+3 (10.3M rows) exhausted a 32GB DuckDB memory cap on our 64GB local machine (`OutOfMemoryException: could not allocate... 29.8/29.8 GiB used`). The full run is ~44x more Source 1 rows. If tuning the blocking parameters down doesn't get us a workable recall-ceiling/compute tradeoff locally, here's the fallback.
+
+**What we actually need.** Nothing here is GPU-bound: normalization, blocking, and the section 3.3 LightGBM/XGBoost classifier are all CPU + RAM workloads. So no `p3`/`g4`/`g5` instances -- we'd be paying for silicon the pipeline can't use. The constraint we hit was RAM for the blocking joins, so the fix is a memory-optimized instance, not more cores or a GPU.
+
+**Instance choice.**
+- Start with `r6i.4xlarge` (16 vCPU, 128GB RAM) or `r7i.4xlarge` -- 4x the DuckDB memory headroom we had locally, at a comparable core count.
+- If that still OOMs at whatever candidate cap we've settled on, step up to `r6i.8xlarge` (32 vCPU, 256GB) rather than guessing further; better to measure once at a size we're confident clears the join than iterate on-instance.
+- Consider Graviton (`r6g`/`r7g`) over Intel/AMD (`r6i`/`r7i`) for ~10-15% lower cost at the same RAM/vCPU -- pandas, DuckDB, and LightGBM all ship arm64 wheels, so there's no reason not to unless something in `requirements.txt` turns out to be x86-only.
+
+**Getting code and data there.**
+1. Push the repo to GitHub (private) or `rsync` it directly -- it's just code, small.
+2. The dataset is the actual weight (100-500MB per source file per section 2, a few GB total across train+test). Upload once to S3 (`aws s3 cp -r student_resource/dataset s3://<bucket>/dataset`) rather than `scp` -- it's resumable and fast within-region, and we can reuse the same upload across multiple instance attempts instead of re-transferring from a laptop each time.
+3. On the instance: `git clone`, `aws s3 sync s3://<bucket>/dataset student_resource/dataset`, `pip install -r requirements.txt duckdb`.
+4. Run under `tmux`/`nohup` -- these jobs run for minutes to hours, and a dropped SSH connection shouldn't kill a run we've been waiting on.
+5. Sync results (`candidate_pairs.tsv`, recall-ceiling logs) back to S3, then down to the laptop, before tearing the instance down.
+
+**Cost control.**
+- Spot instances for every exploratory/measurement run (this step, the recall-ceiling sweep, feature-extraction tuning) -- an interruption just means rerunning a script, nothing stateful is lost. Save on-demand for the one full pipeline run closest to submission, where an interruption would actually cost time we don't have.
+- Stop or terminate the instance the moment a run finishes. An idle `r6i.4xlarge` left running overnight is the real cost risk here, not the per-hour rate while we're actually using it.
+- Memory-optimized on-demand rates are roughly $1-2/hr for the 4xlarge/8xlarge sizes as of writing -- confirm current pricing before committing, since this moves.
+
+**When to actually reach for this.** Not yet. Lowering `max_postings`, reworking the blocking score, or accepting a smaller `top_k` are all still on the table locally and cost nothing. AWS is the fallback once we've confirmed the *algorithm* is right at small scale and the only remaining problem is that this laptop's RAM can't fit the full-scale join -- not before.
